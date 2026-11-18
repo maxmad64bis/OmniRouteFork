@@ -5,6 +5,9 @@ import {
   REPLI,
   borne_numerique,
   borne_ttl_ms,
+  TTL_30J_MS,
+  ttl_30j_non_effondre,
+  CORRECTION_TTL_30J,
   identite_item,
   cleanup_proprietaire,
   cle_resultat,
@@ -31,13 +34,53 @@ test("borne_numerique — limite : TTL 30 j -> INT32_MAX, jamais 1 ms", () => {
 });
 
 test("PREDICATS — les cinq prédicats nommés sont exposés", () => {
-  assert.deepEqual(Object.keys(PREDICATS).sort(), [
+  const noms = Object.keys(PREDICATS);
+  for (const nom of [
     "borne_numerique",
     "cle_resultat",
     "cleanup_proprietaire",
     "identite_item",
     "reprise_checkpoint",
-  ]);
+  ]) {
+    assert.ok(noms.includes(nom));
+  }
+  assert.equal(TTL_30J_MS, 2592000000);
+  assert.ok(noms.includes("ttl_30j_non_effondre"));
+});
+
+// ---------------------------------------------------------------------------
+// 1c. ttl_30j_non_effondre / limite canonique « TTL 30 j -> 1 ms »
+// ---------------------------------------------------------------------------
+test("ttl_30j_non_effondre — nominal : TTL 30 j valide, aucun signal", () => {
+  const valide = "const ttl = 30 * 86400 * 1000;";
+  assert.equal(ttl_30j_non_effondre({ code: valide, ligne: valide }), true);
+  const borne = "const ttl = 2147483647; // 30 * 86400 * 1000 borne INT32_MAX";
+  assert.equal(ttl_30j_non_effondre({ code: borne, ligne: borne }), true);
+  // Aucun faux REFUS : `ttl = 1` sans contexte 30 j n'est pas jugé.
+  const sansContexte = "const ttl = 1; // cache court";
+  assert.equal(ttl_30j_non_effondre({ code: sansContexte, ligne: sansContexte }), true);
+  // Orchestration : aucun signal sur ces TTL légitimes (un fichier chacun).
+  const r = bornes_identite({
+    cibles: [
+      { file: "config/ttl-valide.mjs", text: valide },
+      { file: "config/ttl-borné.mjs", text: borne },
+      { file: "config/ttl-court.mjs", text: sansContexte },
+    ],
+  });
+  assert.equal(r.comptage.refus, 0);
+});
+test("ttl_30j_non_effondre — limite : TTL 30 j effondré à 1 ms -> REFUS nommé", () => {
+  const code = "// TTL attendu : 30 * 86400 * 1000 ms\nconst ttl = 1;";
+  const ligne = "const ttl = 1;";
+  assert.equal(ttl_30j_non_effondre({ code, ligne }), false);
+  const r = bornes_identite({ cibles: [{ file: "config/ttl.mjs", text: code }] });
+  assert.equal(r.ok, false);
+  assert.equal(r.comptage.refus, 1);
+  assert.equal(r.refus[0].predicat, "ttl_30j_non_effondre");
+  assert.equal(r.refus[0].file, "config/ttl.mjs");
+  assert.equal(r.refus[0].ligne, ligne);
+  assert.equal(r.refus[0].correction, CORRECTION_TTL_30J);
+  assert.match(r.refus[0].correction, /86400|2592000000|node --test/);
 });
 
 // ---------------------------------------------------------------------------

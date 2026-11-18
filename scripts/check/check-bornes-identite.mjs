@@ -40,6 +40,39 @@ export function borne_ttl_ms(jours, { repli = REPLI, plafond = INT32_MAX } = {})
   return Math.min(Math.max(ms, 1), plafond);
 }
 
+// Durée canonique d'un TTL de 30 jours : 2 592 000 000 ms (dérivée de MS_PAR_JOUR,
+// pas une constante applicative codée en dur).
+export const TTL_30J_MS = 30 * MS_PAR_JOUR;
+
+// ---------------------------------------------------------------------------
+// 1b. ttl_30j_non_effondre — limite canonique du brief « TTL 30 j -> 1 ms ».
+//     Le plafonnement de `borne_ttl_ms` ne REMPLACE PAS la détection du défaut :
+//     quand le code annonce 30 jours (commentaire ou expression attendue) mais
+//     pose `ttl = 1`, on refuse avec chemin + ligne + commande de correction.
+//     Sans contexte 30 j, aucun signal (pas de faux REFUS sur un TTL légitime).
+// ---------------------------------------------------------------------------
+const ATTENDU_30J_RE =
+  /30\s*\*\s*86400\s*\*\s*1000|30\s*\*\s*MS_PAR_JOUR|30\s*\*\s*24\s*\*\s*60\s*\*\s*60\s*\*\s*1000|2[_ ]?592[_ ]?000[_ ]?000|30\s*(?:j|jours?|days?)\b/i;
+const TTL_EFFONDRE_RE = /\bttl\w*\s*[:=]\s*1\b/i;
+
+export function ttl_30j_non_effondre({ code = "", ligne = "" } = {}) {
+  const cible = String(ligne || code);
+  if (!TTL_EFFONDRE_RE.test(cible)) return true; // pas de `ttl = 1` -> rien à signaler
+  // Contexte borné à ±3 lignes : un 30 j ailleurs dans le fichier ne doit pas
+  // faire refuser un TTL court légitime (pas de faux REFUS).
+  const lignes = String(code).split(/\r?\n/);
+  const idx = lignes.findIndex((l) => l === cible);
+  const debut = idx === -1 ? 0 : Math.max(0, idx - 3);
+  const fin = idx === -1 ? lignes.length : idx + 4;
+  const voisinage = lignes.slice(debut, fin).join("\n");
+  if (!ATTENDU_30J_RE.test(voisinage)) return true; // aucun 30 j attendu -> vert
+  return false; // 30 j effondré à 1 ms -> REFUS
+}
+
+export const CORRECTION_TTL_30J =
+  `correction : ttl = 30 * 86400 * 1000 (${TTL_30J_MS} ms) ou la borne validée ; ` +
+  `rejouer 'node --test tests/unit/check-bornes-identite-predicats.test.mjs'`;
+
 // ---------------------------------------------------------------------------
 // 2. identite_item — identité issue d'une matrice de frames GÉNÉRÉE, jamais
 //    d'un ID codé en dur. La dernière frame choice0 gagne ; la suppression
@@ -122,6 +155,7 @@ export function reprise_checkpoint({ code = "", lots = [] } = {}) {
 
 export const PREDICATS = Object.freeze({
   borne_numerique,
+  ttl_30j_non_effondre,
   identite_item,
   cleanup_proprietaire,
   cle_resultat,
@@ -129,6 +163,11 @@ export const PREDICATS = Object.freeze({
 });
 
 const DECLENCHEURS = [
+  // Prioritaire : un TTL 30 j effondré doit être refusé avant le simple bornage.
+  [
+    "ttl_30j_non_effondre",
+    /\bttl\w*\s*[:=]\s*1\b|30\s*\*\s*86400\s*\*\s*1000|30\s*\*\s*MS_PAR_JOUR|2[_ ]?592[_ ]?000[_ ]?000|\b30\s*(?:j|jours?|days?)\b/i,
+  ],
   ["borne_numerique", /\b(?:maxTokens?|ttl|borne|plafond|limit)\s*[:=]/i],
   ["identite_item", /\b(?:frames?|choix0|choice0|identite|identity)\b/i],
   ["cleanup_proprietaire", /\b(?:registry|cleanup|existing|refreshAndPublish|thisSetup)\b/],
@@ -157,6 +196,7 @@ export function bornes_identite({ cibles = [], preuves = {} } = {}) {
           ok =
             PREDICATS[nom]({
               code: preuves.code ?? text,
+              ligne,
               onPersist: preuves.onPersist ?? "",
               frames: preuves.frames ?? [],
               candidat: preuves.candidat,
@@ -167,7 +207,11 @@ export function bornes_identite({ cibles = [], preuves = {} } = {}) {
       } catch {
         ok = false; // prédicat qui jette = REFUS, jamais un `||` toujours vrai
       }
-      if (!ok) refus.push({ file, ligne, predicat: nom });
+      if (!ok) {
+        const entree = { file, ligne, predicat: nom };
+        if (nom === "ttl_30j_non_effondre") entree.correction = CORRECTION_TTL_30J;
+        refus.push(entree);
+      }
     }
   }
   return { ok: refus.length === 0, refus, comptage: { evalues, refus: refus.length } };
@@ -209,6 +253,7 @@ function main() {
   );
   for (const r of resultat.refus.slice(0, 50)) {
     console.log(`REFUS ${r.predicat} ${r.file} : ${r.ligne.trim().slice(0, 160)}`);
+    if (r.correction) console.log(`  ${r.correction}`);
   }
   if (!resultat.ok) process.exit(1);
 }
