@@ -139,6 +139,11 @@
       "disposition": "separately-invoked"
     },
     {
+      "name": "check:doc-code-parite",
+      "command": "node scripts/check/check-doc-code-parite.mjs",
+      "disposition": "separately-invoked"
+    },
+    {
       "name": "check:doc-links",
       "command": "node scripts/check/check-doc-links.mjs",
       "disposition": "separately-invoked"
