@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "source": "PR 18230 / CR-C11-C12 — lue au runtime par display_name_golden (jamais codée en dur)",
+  "cas": [
+    {
+      "id": "combo-sans-nom-garde-son-nom",
+      "provider": "OpenAI",
+      "name": "",
+      "rawModelId": "kg/auto-fallback",
+      "expected": "kg/auto-fallback",
+      "note": "combo sans name ni rawModelId garde son nom"
+    },
+    {
+      "id": "18230-gpt4-turbo-preview",
+      "provider": "OpenAI",
+      "name": "GPT-4 - Turbo preview",
+      "expected": "OpenAI - GPT-4 - Turbo preview",
+      "note": "le nom complet est conservé et préfixé du provider"
+    },
+    {
+      "id": "18230-vrai-prefixe-stripe",
+      "provider": "OpenAI",
+      "name": "OpenAI - GPT-4 - Turbo preview",
+      "expected": "Turbo preview",
+      "note": "le vrai préfixe OpenAI - GPT-4 reste stripé"
+    }
+  ]
+}
