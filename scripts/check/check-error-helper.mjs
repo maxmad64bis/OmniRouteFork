@@ -26,10 +26,61 @@
 // client. See SANITIZED_CALL below for the replacement.
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { assertNoStale } from "./lib/allowlist.mjs";
 
 const cwd = process.cwd();
+const EMPTY_ALLOWLIST = new Set();
+
+/**
+ * T13 — portée DIFF-BASED. Cibles = fichiers modifiés vs la base de la PR + fichiers
+ * non suivis. `git diff "$BASE" --name-only` NU rend 0 cible sur une PR déjà commitée :
+ * toujours qualifier par la base. Aucune allowlist à étendre, aucun seuil levé.
+ * @param {string} base
+ * @param {string} [cwdDir]
+ * @returns {string[]} chemins relatifs (unix)
+ */
+export function portee_scan(base, cwdDir = cwd) {
+  const git = (args) =>
+    execFileSync("git", args, {
+      cwd: cwdDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  if (!base) return [];
+  // Même discipline que garde_base : une base qui ne résout pas rend 0 cible et
+  // des checks muets. La refuser explicitement plutôt que de conclure « 0 FAIL ».
+  git(["rev-parse", "--verify", "-q", `${base}^{commit}`]);
+  const changed = git(["diff", "--name-only", base]).split("\n").filter(Boolean);
+  const untracked = git(["ls-files", "--others", "--exclude-standard"]).split("\n").filter(Boolean);
+  return [...new Set([...changed, ...untracked])].map((p) => p.replace(/\\/g, "/"));
+}
+
+/** Un chemin de la portée de scan (les 3 SCAN_DIRS + les routes src/app/api). */
+function dansPortee(rel) {
+  return (
+    SCAN_DIRS.some((d) => {
+      const prefix = path.relative(cwd, d).replace(/\\/g, "/");
+      return rel === prefix || rel.startsWith(prefix + "/");
+    }) || IS_API_ROUTE.test(rel)
+  );
+}
+
+/** Base d'une violation à la baseline : vide pour un fichier nouveau/stagé. */
+function baselineSource(base, rel) {
+  if (!base) return "";
+  try {
+    execFileSync("git", ["cat-file", "-e", `${base}:${rel}`], { cwd, stdio: "ignore" });
+    return execFileSync("git", ["show", `${base}:${rel}`], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return "";
+  }
+}
 
 // Directories to scan (Hard Rule #12 applies to ALL error-response-building surfaces).
 // 6A.8: expanded from executors+handlers to include MCP server tools and API route files.
@@ -252,6 +303,105 @@ const INTERNAL_SINK =
 const INTERNAL_SINK_CALL =
   /\b(?:saveCallLog|logToolCall|log\??\.\w+|console\.\w+|reqLogger\.\w+)\s*\(\s*(?:["'`][^"'`]*["'`]\s*,\s*)*\{?\s*$/;
 
+// --- T13 : détecteur LOG_SINK (DISTINCT de l'ancre de suppression ci-dessus) --------
+// L'ancre INTERNAL_SINK_CALL sert à SUPPRIMER les faux positifs (audit rows). On ne la
+// modifie pas. LOG_SINK juge l'ARGUMENT MESSAGE (2e argument, `?.` après la méthode
+// accepté) : true = message sûr, false = erreur brute interpolée -> REFUS.
+// Il s'exécute AVANT les `if (INTERNAL_SINK.test(line)) continue` (C-12) : une ligne
+// log.* est un INTERNAL_SINK, donc un contrôle placé après ces continue serait du code
+// mort. Il porte sur l'argument, pas sur la ligne entière.
+const LOG_SINK_HEAD = /\b(?:log|logger)\s*\??\s*\.\s*\w+\s*\??\s*\.?\s*\(/;
+// Sanitizers reconnus : neutralisés avant le test d'erreur brute, sinon
+// `sanitizeErrorMessage(err.message)` serait refusé à tort.
+const SANITIZE_IN_MESSAGE =
+  /\b(?:sanitizeErrorMessage|sanitizeUpstreamDetails|redactSensitiveErrorText|toSafeMcpErrorMessage|formatProviderError)\s*\([^)]*\)/g;
+// `err.message`, `proxyErr.message`, `String(err)` … (le RAW_ERR historique a un
+// lookbehind qui manque `proxyErr` : il faut un motif dédié au nom d'erreur quelconque).
+const LOG_RAW_ERR =
+  /\b\w*(?:err|error)\w*\.(?:message|stack)\b|\bString\s*\(\s*\w*(?:err|error)\w*\s*\)/i;
+
+/** Arguments de premier niveau d'un appel log.*, en respectant chaînes et imbrications. */
+function logSinkArgs(line) {
+  const head = line.match(LOG_SINK_HEAD);
+  if (!head) return null;
+  const open = head.index + head[0].lastIndexOf("(");
+  const args = [];
+  let depth = 0;
+  let quote = null;
+  let start = open + 1;
+  for (let i = open + 1; i < line.length; i++) {
+    const ch = line[i];
+    if (quote) {
+      if (quote === "`" && ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(" || ch === "{" || ch === "[") depth++;
+    else if (ch === ")" || ch === "}" || ch === "]") {
+      if (ch === ")" && depth === 0) {
+        args.push(line.slice(start, i).trim());
+        return args;
+      }
+      depth--;
+    } else if (ch === "," && depth === 0) {
+      args.push(line.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  return args;
+}
+
+/** Vrai si la ligne porte un appel log.* passant un message par sanitizeErrorMessage. */
+function messageSanitisee(line) {
+  const args = logSinkArgs(line);
+  if (!args) return SANITIZED_CALL.test(line);
+  return args.some((a) => SANITIZED_CALL.test(a));
+}
+
+/**
+ * @param {string} line
+ * @returns {boolean} true = message sûr (vert), false = erreur brute (REFUS)
+ */
+export function LOG_SINK(line) {
+  if (typeof line !== "string") return true;
+  const args = logSinkArgs(line);
+  if (!args || args.length < 2) return true;
+  const message = args[1];
+  if (!message) return true;
+  // Objet/tableau = données structurées d'audit (ex. `{ detail: err.message }`), pas un
+  // message : l'ancrage de suppression existant les couvre déjà. On ne les refuse pas.
+  if (/^\s*[{\[]/.test(message)) return true;
+  const cleaned = message.replace(SANITIZE_IN_MESSAGE, "");
+  return !LOG_RAW_ERR.test(cleaned);
+}
+
+/**
+ * T13/G5 — signal si un `catch` de boucle de refresh neutralise son résultat
+ * (`rows = null`) sans le journaliser via `sanitizeErrorMessage`. Factorisé avec
+ * LOG_SINK : même parseur `logSinkArgs`, même lecture de l'argument message ; la
+ * journalisation doit en plus nommer explicitement un sanitizer.
+ * @param {string} source
+ * @returns {boolean} true = signal (REFUS), false = vert
+ */
+export function erreur_non_sanitifiee(source) {
+  const lines = String(source).split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (!/\bcatch\s*\(\s*\w+\s*\)/.test(lines[i])) continue;
+    const body = lines.slice(i, Math.min(lines.length, i + 14));
+    if (!body.some((l) => /\b\w+\s*=\s*null\b/.test(l))) continue;
+    const journalise = body.some((l) => LOG_SINK_HEAD.test(l) && messageSanitisee(l));
+    if (!journalise) return true;
+  }
+  return false;
+}
+
 // A line that is constructing a client-facing response/result body.
 const RESPONSE_LINE =
   /new\s+Response\s*\(|\bresponse\s*:|\berrResp\s*\(|\bmakeErrorResponse\s*\(|\berrorResponse\s*\(/;
@@ -423,8 +573,19 @@ function isTrustedLine(line, importedNames, localBuilders) {
   );
 }
 
-function forwardsRawError(source, isMcpServer = false) {
+function forwardsRawError(source, isMcpServer = false, newDetectors = false) {
   const lines = source.split("\n").map((l) => l.replace(/\/\/.*$/, ""));
+
+  // T13/C-12 : LOG_SINK s'exécute AVANT les suppressions INTERNAL_SINK ci-dessous.
+  // Une ligne log.* est un INTERNAL_SINK : contrôler son message APRÈS les `continue`
+  // serait du code mort. Uniquement en mode portee_scan (diff-based) pour ne pas
+  // retourner en faux positif le passif historique des 51 log.* déjà journalisés.
+  if (newDetectors) {
+    for (const line of lines) {
+      if (LOG_SINK_HEAD.test(line) && !LOG_SINK(line)) return true;
+    }
+  }
+
   const importedNames = importedErrorHelperNames(source);
   const localBuilders = sanitizingLocalBuilders(source);
   const safeEnvelopes = locallySanitizedEnvelopes(source);
@@ -608,12 +769,14 @@ function enclosedByErrorResponseBody(lines, idx) {
   return false;
 }
 
-export function findErrorHelperViolations(files, allowlist) {
+export function findErrorHelperViolations(files, allowlist, opts = {}) {
+  const newDetectors = opts.newDetectors === true;
   const violations = [];
   for (const { path: rel, source } of files) {
     if (allowlist.has(rel)) continue;
     const isMcpServer = rel.startsWith("open-sse/mcp-server/");
-    if (forwardsRawError(source, isMcpServer)) violations.push(rel);
+    if (forwardsRawError(source, isMcpServer, newDetectors)) violations.push(rel);
+    else if (newDetectors && erreur_non_sanitifiee(source)) violations.push(rel);
   }
   return violations;
 }
@@ -640,7 +803,73 @@ function collectFiles() {
   return files;
 }
 
+/**
+ * T13 — exécution diff-based : seules les violations NOUVELLES échouent. Une baseline
+ * vide (fichier nouveau/stagé) rend toute violation nouvelle. Aucune allowlist à
+ * étendre, aucune baseline à geler, SCAN_DIRS inchangé (jamais open-sse/services/).
+ * @param {string} base
+ */
+function mainPortee(base) {
+  let brutes;
+  try {
+    brutes = portee_scan(base);
+  } catch (err) {
+    console.error(`REFUS : base ${base} ne résout pas (${err.message}) — checks muets`);
+    process.exitCode = 1;
+    return;
+  }
+  // Discipline garde_base : 0 cible brute = détecteur muet, on refuse au lieu de
+  // conclure vert. Le filtrage sur la portée de scan vient APRÈS ce garde-fou.
+  if (!brutes.length) {
+    console.error(`REFUS : ${base} rend 0 cible — checks muets`);
+    process.exitCode = 1;
+    return;
+  }
+  const cibles = brutes.filter(dansPortee);
+  if (!cibles.length) {
+    console.log(
+      `[check-error-helper] OK — portee_scan ${base} : ${brutes.length} cible(s), 0 évaluée`
+    );
+    return;
+  }
+
+  const nouvelles = [];
+  for (const rel of cibles) {
+    if (!fs.existsSync(path.join(cwd, rel))) continue; // fichier supprimé
+    const travail = fs.readFileSync(path.join(cwd, rel), "utf8");
+    const baseSrc = baselineSource(base, rel);
+    const avant = findErrorHelperViolations([{ path: rel, source: baseSrc }], EMPTY_ALLOWLIST, {
+      newDetectors: true,
+    });
+    const apres = findErrorHelperViolations([{ path: rel, source: travail }], EMPTY_ALLOWLIST, {
+      newDetectors: true,
+    });
+    if (apres.length && !avant.length) nouvelles.push(rel);
+  }
+
+  if (nouvelles.length) {
+    console.error(
+      `[check-error-helper] ${nouvelles.length} nouvelle(s) violation(s) vs ${base} :\n` +
+        nouvelles.map((v) => "  ✗ " + v).join("\n")
+    );
+    process.exitCode = 1;
+    return;
+  }
+  console.log(
+    `[check-error-helper] OK — portee_scan ${base} : ${cibles.length} cible(s), 0 nouvelle violation`
+  );
+}
+
 function main() {
+  // BASE vient du source de base.sh (BINOME_BASE / upstream/<branche>). En CI sans
+  // BASE, le comportement historique (allowlist) reste inchangé et vert.
+  const base =
+    process.argv[2] || process.env.BASE || process.env.BASE_SHA || process.env.BINOME_BASE || "";
+  if (base) {
+    mainPortee(base);
+    return;
+  }
+
   const files = collectFiles();
 
   // 6A.8: stale-allowlist enforcement.
