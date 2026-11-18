@@ -150,8 +150,23 @@ test("attente_active — nominal : boucle avec waiters.push(resolve) -> vert", (
   assert.equal(a(diff, "attente_active"), false);
 });
 
+test("attente_active — nominal : process.nextTick hors boucle -> vert", () => {
+  const diff = d("process.nextTick(flush);");
+  assert.equal(a(diff, "attente_active"), false);
+});
+
 test("attente_active — limite : await new Promise(setImmediate) dans un while de worker -> REFUS", () => {
   const diff = d("while (worker.busy) {", "  await new Promise(r => setImmediate(r));", "}");
+  assert.equal(a(diff, "attente_active"), true);
+});
+
+test("attente_active — limite : while + process.nextTick -> REFUS du prédicat nommé", () => {
+  const diff = d("while (worker.busy) {", "  process.nextTick(flush);", "}");
+  assert.equal(a(diff, "attente_active"), true);
+});
+
+test("attente_active — limite : while + setImmediate direct -> REFUS du prédicat nommé", () => {
+  const diff = d("while (worker.busy) {", "  setImmediate(flush);", "}");
   assert.equal(a(diff, "attente_active"), true);
 });
 
@@ -256,6 +271,15 @@ test("horloge_activite_rafraichie — limite : une seule écriture au démarrage
   const signaux = horloge_activite_rafraichie(diff);
   assert.equal(signaux.length > 0, true);
   assert.equal(signaux[0].correction.includes("3"), true);
+});
+
+test("horloge_activite_rafraichie — limite VIA verifierInvariants : câblage du prédicat nommé", () => {
+  const diff = d("this.lastActivityAt = Date.now(); // démarrage");
+  const signaux = verifierInvariants(diff);
+  assert.equal(
+    signaux.some((r) => r.predicat === "horloge_activite_rafraichie"),
+    true
+  );
 });
 
 // === 11. assertion_payload_publie (CR-B3/F3) ==============================

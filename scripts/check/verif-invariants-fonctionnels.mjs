@@ -210,6 +210,16 @@ export function emission_apres_sink(diff) {
 // ---------------------------------------------------------------------------
 // 6. attente_active (CR-C3) — setImmediate/nextTick dans une boucle
 // ---------------------------------------------------------------------------
+// Formes de busy-wait dans une boucle (table T14 / CR-C3) :
+//   - await new Promise(r => setImmediate(r))   (forme historique)
+//   - setImmediate(fn) direct                   (découverte du reviewer, round 1)
+//   - process.nextTick(fn)                      (découverte du reviewer, round 1)
+const ATTENTE_ACTIVE_RE = [
+  /\bawait\s+new\s+Promise\s*\([^)]*\bsetImmediate\s*\(/,
+  /\bsetImmediate\s*\(/,
+  /\bprocess\s*\.\s*nextTick\s*\(/,
+];
+
 export function attente_active(diff) {
   const out = [];
   for (const [, ls] of grouperParChemin(diff)) {
@@ -219,16 +229,13 @@ export function attente_active(diff) {
     let dansBoucle = false;
     for (const e of ls) {
       if (/\b(?:while|for)\s*\(/.test(e.line)) dansBoucle = true;
-      if (
-        dansBoucle &&
-        !aDesWaiters &&
-        /\bawait\s+new\s+Promise\s*\([^)]*\bsetImmediate\s*\(/.test(e.line)
-      ) {
+      if (dansBoucle && !aDesWaiters && ATTENTE_ACTIVE_RE.some((re) => re.test(e.line))) {
         out.push(
           signal(
             "attente_active",
             e,
-            "busy-wait : await new Promise(setImmediate) dans une boucle de worker — utiliser une file waiters.push(resolve)"
+            "busy-wait : setImmediate (direct ou dans await new Promise) ou process.nextTick " +
+              "dans une boucle de worker — utiliser une file waiters.push(resolve)"
           )
         );
       }
