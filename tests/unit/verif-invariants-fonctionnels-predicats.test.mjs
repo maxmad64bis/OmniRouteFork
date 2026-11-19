@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   verifierInvariants,
   whitespaceTrimSet,
@@ -209,7 +212,8 @@ test("display_name_golden — limite : strip naïf casse GPT-4 - Turbo preview -
 });
 
 test("display_name_golden — VB-4 : table ABSENTE -> REFUS immédiat", () => {
-  const dirAbsent = "/tmp/opencode/t14-goldens-absents";
+  const dirAbsent = join(tmpdir(), `t14-goldens-absents-${process.pid}-${Date.now()}`);
+  assert.equal(existsSync(dirAbsent), false, "le répertoire doit être absent pour tester VB-4");
   const diff = d("const name = buildModelDisplayName(combo);");
   const signaux = display_name_golden(diff, { goldensDir: dirAbsent });
   assert.equal(signaux.length, 1);
@@ -217,10 +221,15 @@ test("display_name_golden — VB-4 : table ABSENTE -> REFUS immédiat", () => {
 });
 
 test("display_name_golden — VB-4 : table VIDE -> REFUS immédiat", () => {
-  const diff = d("const name = buildModelDisplayName(combo);");
-  const signaux = display_name_golden(diff, { goldensDir: "/tmp/opencode" });
-  assert.equal(signaux.length, 1);
-  assert.equal(signaux[0].line, "(table absente ou vide)");
+  const dirVide = mkdtempSync(join(tmpdir(), "t14-goldens-vides-"));
+  try {
+    const diff = d("const name = buildModelDisplayName(combo);");
+    const signaux = display_name_golden(diff, { goldensDir: dirVide });
+    assert.equal(signaux.length, 1);
+    assert.equal(signaux[0].line, "(table absente ou vide)");
+  } finally {
+    rmSync(dirVide, { recursive: true, force: true });
+  }
 });
 
 // === 8. source_garde_avant_predicat (CR-B4/F4) =============================
